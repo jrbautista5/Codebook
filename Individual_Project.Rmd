@@ -1,0 +1,1182 @@
+---
+title: "Individual Project"
+author: "Jose Rueben Bautista"
+date: "10/8/2018"
+output: html_document
+---
+
+```{r include = FALSE}
+library(tidyverse)
+library(ggplot2)
+library(MASS)
+library(pROC)
+library(MatchIt)
+library(CBPS)
+library(rms)
+library(splines)
+library(twang)
+adapt_OG <- read.csv("/Users/ruebenbautista/Desktop/MS\ Biostatistics/Fall\ 2018/576C/Individual\ Project/ADAPT_updated.csv", header = TRUE)
+bmi <- read.csv("/Users/ruebenbautista/Desktop/MS\ Biostatistics/Fall\ 2018/576C/Individual\ Project/adapt_bmi.csv", header = T)
+bmi <- select_(bmi, "id", "bmiv1")
+```
+
+
+Rename some of the variables, with a copy of the dataframe to make it easier to work with in `R`:
+
+```{r include = F}
+adapt <- adapt_OG
+adapt$ID <- adapt$Adapt.ID
+adapt$Race <- adapt$Race.
+adapt$Ethnicity <- adapt$Ethnic.background.
+adapt$MajorCode <- adapt$X7..Major.Code
+#adapt$Night.Shift <- adapt$X14..Did.you.ever.work.night.shifts.on.that.job.....NOTE..Night.shift.is.defined.as.a.4.hour.period.of.work.covering.12AM.to.4AM.
+adapt$ShiftType <- adapt$X20..What.shift.did.you.typically.work..on.that.job...
+adapt$FirstShift <- (ifelse(adapt$ShiftType == "Day, First Shift (typically starts ~7-9am)", 1, 0))
+adapt$PayType <- adapt$X26..Were.you.on.salary.or.did.you.get.paid.by.the.hour..or.by.piece.work.or.some.other.way..
+adapt$LaidOff <- adapt$X41..Have.you.ever.been.laid.off.from.other.jobs.in.the.past..
+adapt$AHI <- adapt$AHI..
+
+adapt <- adapt %>%
+  select_("ID", "Age", "Gender", "Race", "Ethnicity", 
+          "MajorCode", "AHI", "LaidOff", 
+          "PayType", "FirstShift")
+
+#Get rid of the extra --1 on the IDs. 
+adapt$ID <- as.numeric(str_replace(adapt$ID, "--1", ""))
+bmi <- rename_(bmi, "ID" = "id")
+
+#Merge adapt with the bmi data
+adapt <- left_join(adapt, bmi, by = "ID")
+```
+
+
+Now that the data is renamed in somewhat more reasonable language, we can begin to determine what the research question is and how we want to set up the data in order to answer this question.
+
+###Research Question: Is sleep disordered breathing severity associated with a past history of multiple job lay-offs?
+
+Theory is that individuals with higher levels of sleep disordered breathing (SDB) have a history of being laid off more often due to work performance deficits/ sleepiness (a major side effect of SDB).  
+
+  - Exposure? Sleep Disorder Breathing    
+    - (SDB or OSA - Obstructive Sleep Apnea)   
+    - Use different cut-offs (AHI > 5, AHI > 15). Primary focus is on AHI > 15.  
+  - Outcome? Multiple Job Layoffs  
+    - Are we looking at more than one job layoff? Yes. Do we want to run an additional analysis that compares 0, 1, > 1 job layoffs?  
+
+
+####Secondary-Question: Are unemployed individuals with SDB more likely to have previously worked in industry with social-focus (management, healthcare, sales)?
+
+Theory is that being tired and/or sleepy all the time may negatively affect social skills and engagement in work relationships (potential contributing to being fired/let go – although we can’t test that).  
+
+  - Exposure? Sleep Disorder Breathing + Social Worktype  
+  - Outcome? Multiple Job Layoffs   
+
+
+###How would we go about a propensity score analysis?
+  - The goal is to match participants from an observational study such that the only difference between participants is whether or not they were treated.  
+  - Refer to Austis et. al. (A Tutorial and Case Study in Propensity Score Analysis...)  
+    - Likely use propensity score matching to match individuals on covariates that have different AHI classifications.  See how the results change as compared to a simple logistic regression.
+    - Uses logistic regression to predict AHI status based on covariates and assigns a 'propensity score'. Matches observations based on this propensity score.
+    - Main goal is to reduce variance and have a model that solely focuses on the predictor of interest (AHI).
+
+
+###Data manipulation
+Input the words for the major codes. This purely meant for the secondary analysis when we want to define jobs that require social skills.
+```{r include = FALSE}
+MajorCode.Key <- c("Management",
+                   "Business and Financial Operations",
+                   "Computer and Mathematical",
+                   "Architecture and Engineering",
+                   "Life, Physical, and Social Service",
+                   "Community and Social Service",
+                   "Legal",
+                   "Education, Traning, and Library",
+                   "Arts, Design, Entertainment, Sports, and Media",
+                   "Healthcare Practitioners and Technical",
+                   "Healthcare Support",
+                   "Protective Service",
+                   "Food Preparation and Serving",
+                   "Building and Grounds Cleaning and Maintenance",
+                   "Personal Care and Service",
+                   "Sales",
+                   "Office and Administrative",
+                   "Farming, Fishing, and Forestry",
+                   "Construction and Extraction",
+                   "Installation, Maintenance, and Repair",
+                   "Production",
+                   "Transportation and Material Moving"
+                   )
+```
+
+Make changes to the race/ethnicity variable:
+
+```{r}
+adapt$RaceCat <- ifelse(adapt$Race == "White", "White", "Non-White")
+```
+
+Should we consider a different classification method?  
+**Note** all missing observations of race classify themselves as hispanic identity. Should we consider calling them white-hispanics? Is this a jump we can make?
+
+##Define the exposure and outcome explicitly:
+
+####Exposure
+
+Exposure should be binary - AHI > 15 (or AHI > 5). How many observations have data on AHI?
+
+```{r}
+table(is.na(adapt$AHI))
+```
+
+There are a total of `265` observations that do not have missing AHI data. Dr. Haynes indicated that people with missing AHI are not important to the question/direction of the study, so not including these participants is the best option.
+
+Only keep paytypes of salary and hourly:
+
+Remove these people from the data:
+```{r}
+adapt <- adapt %>% 
+            filter(is.na(AHI) == FALSE,
+                   is.na(LaidOff) == FALSE, #Removes participants with missing layoff data
+                   is.na(MajorCode) == FALSE,
+                   PayType == "Hourly" | PayType == "Salary") #Only keeps salary and hourly workers
+
+#Code above is commented because there are discrepancies that can be fixed.
+
+nrow(adapt) #Check number of observations in dataset.
+```
+
+
+Define the new variable of SocialJob:
+```{r}
+social <- c("Management", "Healthcare Practitioners and Technical", "Healthcare Support", "Sales")
+MCK <- data.frame(MajorCode = as.numeric(names(table(adapt$MajorCode))), JobKey = MajorCode.Key)
+adapt <- adapt %>% 
+    left_join(MCK, by = "MajorCode")
+
+adapt$SocialJob <- ifelse(adapt$JobKey %in% social, "Social", "Non-Social")
+```
+
+
+Consider both cutoffs of AHI that we are interested in:
+
+```{r}
+SDB <- ifelse(adapt$AHI > 15, "Yes", "No")
+table(SDB)
+table(SDB, adapt$LaidOff)
+
+# SDB.2 <- ifelse(adapt$AHI > 5, "Yes", "No")
+# table(SDB.2)
+# table(SDB.2, adapt$LaidOff)
+# Decided not to use this classificaiton
+
+#Add these columns to the adapt dataset
+# adapt$SDBClass1 <- SDB.2
+adapt$SDBClass2 <- SDB
+
+#Named in this way because of how the book classifies it. In reality, out classfication of interest is the one without prior knowledge (Class2).
+table(SDB, adapt$LaidOff)
+```
+
+There are 222 members without SDB at a cutoff of 15, and 39 do have SDB. At a cutoff of 5, there are 151 without SDB and 110 that do have it.  We will run the main analysis with a cutoff of 15 and a sensitivity analysis with a cutoff of 5.  
+
+Additionally, we can consider using `AHI` as a continuous response. Assess the distribution of `AHI` and determine if any transformations are necessary.
+
+```{r}
+summary(adapt$AHI)
+ggplot(adapt, aes(x = AHI)) +
+    geom_histogram(binwidth = 9, fill = "light blue")
+
+#Create a log transformed variable of AHI that takes into account 0s.
+adapt$log.AHI <- ifelse(adapt$AHI == 0, log(0.1), log(adapt$AHI))
+adapt$log2.AHI <- ifelse(adapt$AHI == 0, log2(0.1), log2(adapt$AHI))
+
+ggplot(adapt, aes(x = log.AHI)) +
+    geom_histogram(binwidth = 0.65, fill = "orange")
+```
+
+
+From the `summary` and the histogram we can see that the `AHI` variable is skewed heavily to the right. However, for logistic regression, we do not need to transform to meet any of the assumptions of logistic regression. The main requirement is linearity in the logit, this will need to be assessed if we are to use `AHI` as a continuous variable. Which we will assess later on in this document.
+
+
+####Convert AHI into categorical
+```{r}
+AHI.cat <- cut(adapt$AHI, breaks = c(0, 5, 15, 30, 70), right = F)
+levels(AHI.cat) <- c(0, 1, 2, 3)
+adapt$AHI.cat <- AHI.cat
+```
+
+
+####Response - Involuntary Job Loss
+
+The laidoff variable will give us the information regarding multiple job loss. A 0 means they only had lost their job once, where a 1 means they have suffered involuntary job loss twice or more:
+
+```{r}
+table(adapt$LaidOff)
+```
+This table claims that 117 people were laid off more than once and for the 144 they were laid off/fired for the first time.
+
+
+#Descriptive Statistics - No Output:
+
+Here we will gather all of the descriptive statistics and the tests of difference in means and independence:
+
+Stratify on history of multiple job loss:
+```{r eval = F, include = FALSE}
+vars <- c("Age", "Gender", "RaceCat", "Ethnicity", "FirstShift", "PayType",
+          "LaidOff", "AHI", "MajorCode", 
+          "SDBClass2", "AHI.cat", "bmiv1")
+desc.df <- adapt %>%
+            select_(vars[1], vars[2], vars[3], vars[4], vars[5], 
+                    vars[6], vars[7], vars[8], vars[9], vars[10],
+                    vars[11], vars[12])
+
+desc.stat <- desc.df %>%
+                group_by(AHI.cat) %>%
+                summarise(mu.Age = mean(Age), sigma.Age = sd(Age),
+                          mu.BMI = mean(bmiv1, na.rm = T),
+                          sigma.BMI = sd(bmiv1, na.rm = T))
+desc.stat
+
+anova(lm(Age ~ AHI.cat, data = adapt))
+
+anova(lm(bmiv1 ~ AHI.cat, data = adapt))
+
+table(adapt$Gender, adapt$AHI.cat, useNA = 'always')
+chisq.test(adapt$Gender, adapt$AHI.cat, correct = F)
+
+table(adapt$RaceCat, adapt$AHI.cat)
+chisq.test(adapt$RaceCat, adapt$AHI.cat, correct = F)
+
+# table(adapt$Night.Shift, adapt$AHI.cat)
+# chisq.test(adapt$Night.Shift, adapt$AHI.cat, correct = F)
+# #Not significant
+table(adapt$FirstShift, adapt$AHI.cat)
+chisq.test(adapt$FirstShift, adapt$AHI.cat, correct = F)
+#Not significant
+
+table(adapt$PayType, adapt$AHI.cat)
+chisq.test(adapt$PayType, adapt$AHI.cat, correct = F)
+#Not significant
+
+table(adapt$SocialJob, adapt$AHI.cat)
+chisq.test(adapt$SocialJob, adapt$AHI.cat, correct = F)
+#Not significant
+
+table(adapt$LaidOff, adapt$AHI.cat)
+chisq.test(adapt$LaidOff, adapt$AHI.cat, correct = F)
+```
+
+
+#Primary Analysis ***NOT THE PRIMARY ANALYSIS ANYMORE***
+
+Useful covariates? Sex, age, race/ethnicity, job-code, night-shift, social job, pay-type, bmi.
+```{r}
+covariates <- c("Age", "Gender", "RaceCat", "PayType", "Night.Shift",
+                "ShiftType", "SocialJob", "AHI", "bmiv1", "LaidOff", "log.AHI")
+
+adapt.w.bmi <- adapt %>% filter(is.na(bmiv1) == FALSE)
+
+#See how the distribution of log.AHI changes when excluding observations with missing BMI.
+par(mfrow = c(1,2))
+hist(adapt.w.bmi$log.AHI)
+hist(adapt$log.AHI)
+
+#We want to include people that do not have BMI in our analysis. Create a dummy/indicator variable for bmi called BMI_I 
+# that is 1 or 0 depending if BMI data is present. If BMI_I = 1 then set bmiv1 to 0, we will only include the interaction
+#term between bmiv1*BMI_I in the model.
+
+# Decided to not include BMI, if later BMI can be included, uncomment this code.
+# BMI_I <- ifelse(is.na(adapt$bmiv1), 0, 1)
+# adapt$BMI_I <- BMI_I
+# adapt$BMI_Value <- ifelse(is.na(adapt$bmiv1) == T, 0, adapt$bmiv1)
+
+#Recategorize LaidOff and Night.Shift so that they are 0/1 instead of No/Yes
+adapt$LaidOff <- ifelse(adapt$LaidOff == "Yes", 1, 0)
+```
+
+##Check for linearity in the logit with the loess plots:
+
+###AHI
+```{r}
+adapt.mod <- adapt
+lw1 <- loess(LaidOff  ~ AHI, data = adapt.mod)
+plot(LaidOff ~ AHI, data = adapt.mod, pch=19, cex=0.1)
+j <- order(adapt.mod$AHI)
+lines(adapt.mod$AHI[j],lw1$fitted[j],col="red",lwd=3)
+```
+
+###log.AHI
+```{r}
+lw <- loess(LaidOff ~ log.AHI, data = adapt.mod)
+plot(LaidOff ~ log.AHI, data = adapt.mod, pch = 19, cex = 0.1)
+j <- order(adapt.mod$log.AHI)
+lines(adapt.mod$log.AHI[j], lw$fitted[j], col = "red", lwd = 3)
+```
+
+Check, yes, linear.
+
+###log2.AHI 
+```{r}
+lw <- loess(LaidOff ~ log2.AHI, data = adapt.mod)
+plot(LaidOff ~ log2.AHI, data = adapt.mod, pch = 19, cex = 0.1)
+j <- order(adapt.mod$log2.AHI)
+lines(adapt.mod$log2.AHI[j], lw$fitted[j], col = "red", lwd = 3)
+```
+
+###BMI
+```{r}
+dta.bmi <- subset(adapt, is.na(bmiv1) == F)
+lw <- loess(LaidOff ~ bmiv1, data = dta.bmi)
+plot(LaidOff ~ bmiv1, data = dta.bmi, pch = 19, cex = 0.1)
+j <- order(dta.bmi$bmiv1)
+lines(dta.bmi$bmiv1[j], lw$fitted[j], col = "red", lwd = 3)
+```
+
+
+###Age
+```{r}
+lw <- loess(LaidOff ~ Age, data = adapt.mod)
+plot(LaidOff ~ Age, data = adapt.mod, pch = 19, cex = 0.1)
+j <- order(adapt.mod$Age)
+lines(adapt.mod$Age[j], lw$fitted[j], col = "red", lwd = 3)
+```
+
+Not terribly linear, it may be best to fit this variable with splines. **Fit Age with restricted cubic splines with 3 knots**
+
+##Fit the primary model:
+
+```{r}
+primary <- glm(LaidOff ~ AHI + ns(Age, df=3) + Gender + RaceCat + PayType +
+                   FirstShift + SocialJob,
+               data = adapt.mod,
+               family = binomial(link = "logit"))
+
+prob.primary <- predict(primary, type = c("response"))
+adapt.mod$prob <- prob.primary
+g <- roc(LaidOff ~ prob, data = adapt.mod)
+g$auc
+# plot(g) - uncomment if you want to see the ROC curve
+ci(g)
+```
+
+##Gather the adjusted odds ratio from the primary model:
+```{r}
+round(exp(cbind(coef(primary) * 5, confint(primary) * 5)),2)[2,]
+round(exp(cbind(coef(primary) * 10, confint(primary) * 10)), 2)[2,]
+round(exp(cbind(coef(primary) * 15, confint(primary) * 15)), 2)[2,]
+```
+
+The adjusted odds ratio for a 5 unit increase in AHI is 1.21 (95% CI: 1.06-1.41) and the odds ratio for a 10 unit increase in AHI is 1.46 (95% CI: 1.11 - 1.97) and 1.76 (95% CI: 1.18 - 2.78) for 15 unit increase in AHI. The interpretation is that there is an expected greater odds of having a history of job loss for a 5 or 10 unit increase in AHI. Specifically, if two people have an AHI of 6 and 11, then the person with AHI 11 has 1.21 times the odds of having a history of job loss. All of the OR confidence intervals contain 1, so the further conclusions we can make about the OR being significant cannot be made.
+
+**Note**: the area under the ROC curve is `0.69` and the 95% CI is 0.63-0.75. This indicates that the logistic regression model is performing better than random chance, but it is not great at discriminating between those with a history of multiple job loss and those without. (Threshold is c > 0.70)
+
+
+###Run the primary model with the log2.AHI
+```{r}
+#Use log2 because of its simpler interpretibility of doubling
+# adapt.mod <- adapt
+# lprim <- glm(LaidOff ~ log.AHI + ns(Age, df = 3) + Gender + RaceCat +
+#                        PayType + Night.Shift + SocialJob + ShiftType,
+#                    data = adapt.mod,
+#                    family = binomial(link = "logit")) 
+# prob.lp <- predict(lprim, type = c("response"))
+# adapt.mod$lp <- prob.lp
+# g.lp <- roc(LaidOff ~ prob.lp, data = adapt.mod)
+# g.lp$auc
+# ci(g.lp)
+```
+
+Uncomment the code above if we wish to use the log transformation of the model.
+
+
+###Unadjusted model - univariate logistic regression
+```{r}
+un.mod <- glm(LaidOff ~ AHI, 
+              data = adapt, 
+              family = binomial(link="logit"))
+prob.un <- predict(un.mod, type = c("response"))
+adapt$prob.un <- prob.un
+un.g <- roc(LaidOff ~ prob.un, data = adapt)
+un.g$auc
+ci(un.g)
+```
+
+```{r}
+round(c(exp(coef(un.mod) * 5) , exp(confint(un.mod)*5)), 2)[c(2, 4, 6)]
+round(c(exp(coef(un.mod) * 10) , exp(confint(un.mod) * 10)), 2)[c(2, 4, 6)]
+round(c(exp(coef(un.mod) * 15) , exp(confint(un.mod) * 15)), 2)[c(2, 4, 6)]
+```
+
+
+####Using AHI as categorical:
+
+```{r}
+mod.cat <- glm(LaidOff ~ AHI.cat + ns(Age, df = 3) + Gender + RaceCat +
+                   PayType + FirstShift + SocialJob,
+               data = adapt,
+               family = binomial(link = "logit"))
+prob.cat <- predict(mod.cat, type = c("response"))
+adapt$prob.cat <- prob.cat
+g.cat <- roc(LaidOff ~ prob.cat, data = adapt)
+g.cat$auc
+ci(g.cat)
+
+cat.unadj <- glm(LaidOff ~ AHI.cat,
+                 data = adapt,
+                 family = binomial(link = "logit"))
+p <- predict(cat.unadj, type = c("response"))
+adapt$p <- p
+g.p <- roc(LaidOff ~ p, data = adapt)
+g.p$auc
+
+exp(cbind(coef(cat.unadj), confint(cat.unadj)))
+#Odds ratios and confidence intervals
+exp(cbind(coef(mod.cat), confint(mod.cat)))[2:4,]
+```
+After categorizing the AHI variable and building a logistic regression model we get the following results. The odds ratio for people with AHI 5-10 is 1.56 (95% CI: 0.84-2.94), for people with AHI 10-15 is 1.81 (95% CI: 0.73-4.58) and for those with AHI >= 15 the odds ratio is 4.64 (95% CI: 1.33 - 19.4). **All odds ratios are with respect to people with AHI 0-5.**
+
+The conclusion is that those with AHI >= 15 have the greatest odds of having a history of multiple job loss and it is significant at the alpha = 0.05 level. The other two categories of AHI did not have significant odds ratios at the 0.05 level.
+
+
+####Using a different categorization of AHI (to account for small cell size)
+```{r}
+ahi.tricat <- cut(adapt$AHI, breaks = c(0, 5, 15, 70), right = F)
+levels(ahi.tricat) <- c(0, 1, 2)
+adapt$AHI.tri <- ahi.tricat
+
+tri.mod <- glm(LaidOff ~ AHI.tri + ns(Age, df = 3) + Gender + RaceCat +
+                   PayType + FirstShift + SocialJob,
+               data = adapt,
+               family = binomial(link = "logit"))
+prob.tri <- predict(tri.mod, type = c("response"))
+adapt$prob.tri <- prob.tri
+g.tri <- roc(LaidOff ~ prob.tri, data = adapt)
+g.tri$auc
+#c = 0.68
+
+unadj.tri <- glm(LaidOff ~ AHI.tri,
+                 data = adapt,
+                 family = binomial(link = "logit"))
+prob.untri <- predict(unadj.tri, type = c("response"))
+adapt$prob.untri <- prob.untri
+g.untri <- roc(LaidOff ~ prob.untri, data = adapt)
+g.untri$auc
+#c = 0.59
+
+exp(cbind(coef(unadj.tri), confint(unadj.tri)))
+exp(cbind(coef(tri.mod), confint(tri.mod)))[2:3,]
+```
+If we categoirze SDB into: none, mild, moderate-severe we see that the unadjusted odds ratio for those with mild and moderate-severe SDB are both significantly different than 1. Mild: 1.85 (95% CI: 1.04, 3.28), Severe: 2.71 (95% CI: 1.33, 5.71). However, after adjusting for additional covariates, we do see the level of effect slightly decrease for both and actually loses significance for those with mild SDB. Mild_adj_: 1.55 (95% CI: 0.83, 2.90), Severe_adj_: 2.46 (95% CI: 1.13, 5.52)
+
+
+
+###Descriptive stats for reduced categorization of AHI:
+```{r}
+anova(lm(Age ~ AHI.tri, data = adapt))
+
+anova(lm(bmiv1 ~ AHI.tri, data = adapt))
+
+table(adapt$Gender, adapt$AHI.tri, useNA = 'always')
+chisq.test(adapt$Gender, adapt$AHI.tri, correct = F)
+
+table(adapt$RaceCat, adapt$AHI.tri)
+chisq.test(adapt$RaceCat, adapt$AHI.tri, correct = F)
+
+table(adapt$FirstShift, adapt$AHI.tri)
+chisq.test(adapt$FirstShift, adapt$AHI.tri, correct = F)
+#Not significant
+
+table(adapt$PayType, adapt$AHI.tri)
+chisq.test(adapt$PayType, adapt$AHI.tri, correct = F)
+#Not significant
+
+table(adapt$SocialJob, adapt$AHI.tri)
+chisq.test(adapt$SocialJob, adapt$AHI.tri, correct = F)
+#Not significant
+
+table(adapt$LaidOff, adapt$AHI.tri)
+chisq.test(adapt$LaidOff, adapt$AHI.tri, correct = F)
+```
+
+
+###Binary classification of AHI (Definition of OSA) ; compares unadjusted model and covariate adjusted models odds ratios
+
+```{r}
+adapt$AHI.bi <- as.factor(adapt$SDBClass2)
+levels(adapt$AHI.bi)
+bi.mod <- glm(LaidOff ~ AHI.bi + ns(Age, df = 3) + Gender + RaceCat +
+                   PayType + FirstShift + SocialJob,
+               data = adapt,
+               family = binomial(link = "logit"))
+prob.bi <- predict(bi.mod, type = c("response"))
+adapt$prob.bi <- prob.bi
+g.bi <- roc(LaidOff ~ prob.bi, data = adapt)
+g.bi$auc
+#c = 0.6778
+
+
+unadj.bi <- glm(LaidOff ~ AHI.bi,
+                 data = adapt,
+                 family = binomial(link = "logit"))
+prob.unadj.bi <- predict(unadj.bi, type = c("response"))
+adapt$prob.unbi <- prob.unadj.bi
+g.unbi <- roc(LaidOff ~ prob.unbi, data = adapt)
+g.unbi$auc
+#c = 0.5505
+
+exp(cbind(coef(unadj.bi), confint(unadj.bi)))[2,]
+exp(cbind(coef(bi.mod), confint(bi.mod)))[2,]
+```
+
+Covariate adjustment indicates the relationship is not significant.
+
+
+
+#Sensitivity Analyses -- THIS WAS OUR PRIMARY ANALYSIS -- 
+
+##Propensity Score Analysis:
+
+###Binary propensity score analysis:
+
+i) Define sleep disordered breathing using the AHI of 15 as the cutoff:
+**Note** cannot use BMI data when assessing this cutoff because those with BMI data are those without OSA (AHI > 15). Althought bmi is the best predictor of AHI, unfortunately, we cannot use it for the propensity score estimation.
+```{r}
+adapt$OSA <- ifelse(adapt$SDBClass2 == "Yes", 1, 0)
+ps.mod <- glm(OSA ~ ns(Age, df = 3) + FirstShift + PayType + 
+                  SocialJob + RaceCat + Gender,
+              data = adapt,
+              family = binomial(link = "logit"))
+
+prob.ps1 <- predict(ps.mod, type = c("response"))
+adapt$prob.ps1 <- prob.ps1
+g.ps1 <- roc(OSA ~ prob.ps1, data = adapt)
+g.ps1$auc
+ci(g.ps1)
+```
+
+
+```{r}
+prs_df <- data.frame(pr_score = predict(ps.mod, type = "response"),
+                     OSA = ps.mod$model$OSA)
+
+#Visualize the distribution of propensity scores versus the true category they fall into:
+labs <- paste("Actual OSA Status:", c(">15", "<= 15"))
+prs_df %>%
+    mutate(OSA = ifelse(OSA == 1, labs[1], labs[2])) %>%
+    ggplot(aes(x = pr_score)) +
+    geom_histogram(color = "white", binwidth = 0.1) +
+    facet_wrap(~OSA) + 
+    xlab("Probability of OSA") +
+    theme_bw()
+```
+
+Now, we are going to perform the matching algorithm:
+
+```{r}
+cvs <- c("Age", "FirstShift", "PayType", "SocialJob", "RaceCat", "Gender")
+adapt.nomiss <- adapt %>%
+                select_(.dots = c("LaidOff", "OSA", cvs)) %>%
+                na.omit()
+mod.match <- matchit(OSA ~ ns(Age, df = 3) + FirstShift + PayType +
+                         SocialJob + RaceCat + Gender,
+                     method = "nearest", data = adapt.nomiss)
+
+dta.match <- match.data(mod.match)
+dim(dta.match)
+```
+
+We see there are 78 observations in the matched dataset, meaning there are a total of 39 matched pairs.
+
+Next, we are going to assess the covariance balance with the following: 1. visual inspection, 2. t-test difference of means, 3. computation of the average absolute standardized difference (“standardized imbalance”)
+
+####1. Visual inspection
+
+```{r}
+fn_bal <- function(dta, variable) {
+  dta$variable <- dta[, variable]
+  dta$OSA <- as.factor(dta$OSA)
+  support <- c(min(dta$variable), max(dta$variable))
+  ggplot(dta, aes(x = distance, y = variable, color = OSA)) +
+    geom_point(alpha = 0.2, size = 1.3) +
+    geom_smooth(method = "loess", se = F) +
+    xlab("Propensity score") +
+    ylab(variable) +
+    theme_bw() +
+    ylim(support)
+}
+
+fn_bal(dta.match, "Age")
+```
+
+####2. Difference in means (only applies to age):
+```{r}
+dta.match %>%
+    group_by(OSA) %>%
+    select_("Age") %>%
+    summarise_all(funs(mean))
+t.test(dta.match$Age ~ dta.match$OSA)
+```
+
+####3. Average absolute standardized difference
+where βx is the difference between the covariate means in the treated and control groups in the matched sample. An average absolute standardized difference that is close to 0 is preferable, since that indicates small differences between the control and treatment groups in the matched sample.
+
+```{r}
+est <- dta.match %>%
+    group_by(OSA) %>%
+    select_("Age") %>%
+    summarise(beta = mean(Age), sigma = sd(Age))
+
+beta.diff <- abs(est$beta[1] - est$beta[2])
+sigma.diff <- sqrt(est$sigma[1]**2 + est$sigma[2]**2)
+beta.diff / sigma.diff
+```
+The absolute standardized difference for age is `0.0086` which is fairly close to zero which indicates that our matched sample is well balanced.
+
+####4. Categorical absolute standardized difference:
+```{r}
+cat.ASD <- function(p.treat, p.control){
+    num <- p.treat - p.control
+    den <- sqrt( (p.treat * (1 - p.treat) + p.control * (1 - p.control)) / 2 )
+    return(abs(num/den))
+}
+
+table(dta.match$Gender, dta.match$OSA)
+sex.balance <- cat.ASD(27/39, 25/39)
+#0.11
+table(dta.match$FirstShift, dta.match$OSA)
+first.balance.yes <- cat.ASD(30/39, 31/39)
+#0.062
+table(dta.match$PayType, dta.match$OSA)
+pay.balance <- cat.ASD(29/39, 29/39)
+#0.0
+table(dta.match$SocialJob, dta.match$OSA)
+social.balance <- cat.ASD(26/39, 26/39)
+#0.0
+table(dta.match$RaceCat, dta.match$OSA)
+race.balance <- cat.ASD(17/39, 17/39)
+#0.0
+```
+
+The only variable that is not terribly well balanced is sex. And that is likely because there are more men that have an AHI > 15. 52 males and 26 females in the data.
+
+
+####Post Matching Logistic regreesion:
+
+```{r}
+matched.mod <- glm(LaidOff ~ OSA,
+                   data = dta.match,
+                   family = binomial(link = "logit"))
+round(exp(cbind(coef(matched.mod), confint(matched.mod))), 3)[2,]
+
+prob.matched <- predict(matched.mod, type = "response")
+dta.match$prob.matched <- prob.matched
+g.match <- roc(LaidOff ~ prob.matched, data = dta.match)
+g.match$auc
+```
+
+After the propensity score matching we have determined that the odds of having a history of multiple job loss for those with sleep disordered breathing (AHI > 15) is 3.6 (95% CI: 1.44, 9.45) times the odds for those without sleep disordered breathing. Based on the 95% CI, we are allowed to conclude that the odds of having a history of multiple job loss based on sleep disordered breathing is significantly different than 1; i.e. the odds are different for those with/wthout OSA.
+
+
+#Decided not to run this analysis**
+ii) Define sleep disordered breathing as an AHI > 5:
+
+```{r}
+# #First change the definition of OSA in the adapt dataset:
+# ahi5 <- ifelse(adapt$SDBClass1 == "Yes", 1, 0)
+# adapt$OSA <- ahi5
+# #Now, repeat the same propensity score matching performed for the other definition.
+# ps.mod <- glm(OSA ~ ns(Age,df=3) + FirstShift + PayType + 
+#                   SocialJob + RaceCat + Gender,
+#               data = adapt,
+#               family = binomial(link = "logit"))
+# 
+# prs_df <- data.frame(pr_score = predict(ps.mod, type = "response"),
+#                      OSA = ps.mod$model$OSA)
+# 
+# #Visualize the distribution of propensity scores versus the true category they fall into:
+# labs <- paste("Actual OSA Status:", c(">5", "<= 5"))
+# prs_df %>%
+#     mutate(OSA = ifelse(OSA == 1, labs[1], labs[2])) %>%
+#     ggplot(aes(x = pr_score)) +
+#     geom_histogram(color = "white", binwidth = 0.1) +
+#     facet_wrap(~OSA) + 
+#     xlab("Probability of OSA") +
+#     theme_bw()
+# 
+# 
+# #Matching algorithm
+# adapt.nomiss <- adapt %>%
+#                 select_(.dots = c("LaidOff", "OSA", cvs)) %>%
+#                 na.omit()
+# mod.match <- matchit(OSA ~ ns(Age, df = 3) + FirstShift + PayType +
+#                          SocialJob + RaceCat + Gender,
+#                      method = "nearest", data = adapt.nomiss)
+# 
+# dta.match <- match.data(mod.match)
+# dim(dta.match)
+```
+
+Balancing diagnostics:
+
+```{r}
+#1. Visual inspection
+# fn_bal(dta.match, "Age")
+# 
+# #2. Difference in means (only applies to age):
+# dta.match %>%
+#     group_by(OSA) %>%
+#     select_("Age") %>%
+#     summarise_all(funs(mean))
+# 
+# t.test(Age ~ OSA, data = dta.match)
+# 
+# #3. Average absolute standardized difference
+# est <- dta.match %>%
+#     group_by(OSA) %>%
+#     select_("Age") %>%
+#     summarise(beta = mean(Age), sigma = sd(Age))
+# 
+# beta.diff <- abs(est$beta[1] - est$beta[2])
+# sigma.diff <- sqrt(est$sigma[1]**2 + est$sigma[2]**2)
+# beta.diff / sigma.diff
+```
+
+Univariate logistic regression after propensity score matching w/ odds ratio estimate & 95% CI:
+```{r}
+# mod5 <- glm(LaidOff ~ OSA, data = dta.match, family = binomial(link = "logit"))
+# round(exp(cbind(coef(mod5), confint(mod5))), 2)[2,]
+```
+
+From the output we see that the odds ratio estimate is 1.94 (similar to that from the first propensity score matching), however the 95% CI is (1.14, 3.33). What this is telling me is that the standard errors for this method are significantly smaller than the standard errors for the other method (which makes sense, 110 matched pairs versus 39). Althought this is not the cutoff of AHI we are going with, I thought it would be interesting to still look at the results from the analysis.
+
+
+
+#DID NOT RUN THIS ANALYSIS - Kept just in case
+
+###Generalized Propensity Score 
+####Initial exploratory analysis:
+
+First, I think it will be interesting to see how a linear regression model for `log.AHI` changes when we include/do not include BMI. 
+
+**Note: using log2.AHI because AHI is severely skewed to the right and for linear regression the model will fit better if we log transform. After matching we will use the regular AHI variable in the univariate logistic regression model**
+
+```{r}
+# gps.mod <- lm(log2.AHI ~ bmiv1 + ns(Age, df=3) + Gender + RaceCat + 
+#                   FirstShift + PayType + SocialJob, 
+#               data = adapt)
+# 
+# #Compare to a model that does not use BMI (but has more observations due to non-missing)
+# no.bmi.mod <- lm(log2.AHI ~ ns(Age,df=3) + Gender + RaceCat + 
+#                   FirstShift + PayType + SocialJob, 
+#               data = adapt)
+# 
+# c(summary(gps.mod)$adj.r.squared, summary(no.bmi.mod)$adj.r.squared)
+```
+
+Despite losing 68 observations, we are able to almost double our adjusted R squared by including the BMI variable. Therefore, it might be more interesting to include it and drop anyone with missing values. Or, categorize and include a missing category as reference*. The issue with dropping these values is that we drop everyone with an AHI value greater than 15.
+
+What we could do, in order to include the bmi variable, we can introduce an indicator variable for whether BMI is available (0-No, 1-Yes) and then include an interaction term between $I_{BMI}*BMI$ which would allow us to not drop any information and include the impact of BMI. It is essentially a mixture that could allow us to not drop any observations (sample size stays the same) while also introducing information about the presence or lack thereof of BMI.
+
+```{r}
+# m1 <- lm(log2.AHI ~ Age + Gender + RaceCat + Night.Shift +
+#              PayType + SocialJob + ShiftType + BMI_I:BMI_Value,
+#          data = adapt)
+# 
+# m1.a <- lm(log2.AHI ~ ns(Age, df = 3) + Gender + RaceCat + Night.Shift +
+#                PayType + SocialJob + ShiftType + BMI_I:BMI_Value,
+#            data = adapt)
+# 
+# #Compare with the non-transformed AHI variable:
+# m2 <- lm(AHI ~ Age + Gender + RaceCat + Night.Shift +
+#              PayType + SocialJob + ShiftType + BMI_I:BMI_Value,
+#          data = adapt)
+# m2.a <- lm(AHI ~ ns(Age, df = 3) + Gender + RaceCat + Night.Shift +
+#              PayType + SocialJob + ShiftType + BMI_I:BMI_Value,
+#          data = adapt)
+# 
+# cbind(summary(m1)$adj.r.squared, summary(m1.a)$adj.r.squared, summary(m2)$adj.r.squared, summary(m2.a)$adj.r.squared)
+```
+
+Adjusted R-squared when predicting on the log22-transform is 0.153 and when predicting on AHI untransformed the adj R-squared is 0.21 - maybe consider performing the generalized propensity score analysis with the untransformed data? It will leave the interpretibility to be relatively easy. We will perform the log transform first.
+
+Additionally, further confirmation that we should be using restricted cubic splines.
+
+Lastly, we should use the log2-transformed AHI because of this assumption of linear regerssion: "the residuals of the regression model **must** be normally distributed". Inspect the residuals of the non-transformed and transformed AHI variables and determine if both are normally distributed.
+
+
+```{r}
+# m1.res <- data.frame(Res = m1.a$residuals)
+# ggplot(m1.res, aes(x = Res))+
+#     geom_histogram(binwidth = 1)
+# m2.res <- data.frame(Res = m2.a$residuals)
+# ggplot(m2.res, aes(x = Res)) +
+#     geom_histogram(binwidth = 10)
+```
+
+This shows that AHI must be log2 transformed, otherwise it would violate the normality of residuals assumption for multiple linear regression.
+
+
+```{r include = FALSE}
+# dose.response.gps.cov.ols <- NULL
+# dose.response.gps.cov.cbps <- NULL
+# dose.response.gps.wt.ols <- NULL
+# dose.response.gps.wt.cbps <- NULL
+# dose.repsponse.gcomp <- NULL
+```
+
+####Begin the generalized propensity score analysis
+
+```{r}
+# log2.AHI <- adapt$log2.AHI
+# log2.AHI.threshold <- quantile(log2.AHI, probs = (1:9 / 10))
+# #The nine deciles of log.AHI at which we will evaluate the "dose-response" function
+# AHI <- adapt$AHI
+# AHI.threshold <- quantile(AHI, probs = 1:9 / 10)
+# 
+# log2.AHI.scaled <- (log2.AHI -  mean(log2.AHI)) / sd(log2.AHI)
+# adapt$log2.AHI.scaled <- log2.AHI.scaled
+# 
+# AHI.scaled <- (AHI - mean(AHI)) / sd(AHI)
+# adapt$AHI.scaled <- AHI.scaled
+```
+
+Build the GPS model using multiple linear regression:
+```{r}
+# gps.mod <- lm(log2.AHI.scaled ~ ns(Age, df = 3) + Gender + RaceCat +
+#                   FirstShift + PayType + SocialJob,
+#          data = adapt)
+# 
+# gps.ols <- dnorm(adapt$log2.AHI.scaled,
+#                  mean = gps.mod$fitted.values,
+#                  sd = summary(gps.mod)$sigma)
+# 
+# #Numerator for stabilized weights
+# ps.num <- dnorm((adapt$log2.AHI.scaled - mean(adapt$log2.AHI.scaled)) / sd(adapt$log2.AHI), 0, 1)
+# ps.NL <- dnorm((adapt$AHI.scaled - mean(adapt$AHI.scaled)) / sd(adapt$AHI.scaled), 0, 1)
+# 
+# #Stabilized weight:
+# gps.wt.ols <- ps.num / gps.ols
+# 
+# gps.wt.ols.trunc <- ifelse(gps.wt.ols > quantile(gps.wt.ols, probs = 0.99), 
+#                            quantile(gps.wt.ols, probs = 0.99),
+#                            gps.wt.ols)
+```
+
+Use CBPS (covariate balancing propensity score) to estimate the PS (propensity score) and weights:
+```{r}
+# gps.mod.cbps <- CBPS(log2.AHI.scaled ~ ns(Age, df = 3) + Gender + RaceCat + Night.Shift +
+#                          PayType + SocialJob + BMI_I:BMI_Value,
+#                      data = adapt, 
+#                      method = "exact")
+# 
+# adapt$gps.cbps <- dnorm(adapt$log2.AHI.scaled, 
+#                         mean = gps.mod.cbps$fitted.values,
+#                         sd = sqrt(gps.mod.cbps$sigmasq))
+# 
+# adapt$gps.wt.cbps <- gps.mod.cbps$weights
+```
+
+
+####Model the outcome relationship with the GPS and continuous treatment:
+```{r}
+# glm1 <- lrm(LaidOff ~ log2.AHI.scaled + gps.ols,
+#             data = adapt)
+# 
+# mean.pf <- gps.mod$fitted.values
+# s.pf <- summary(gps.mod)$sigma
+# 
+# 
+# for (i in 1:length(log2.AHI.threshold)){
+#     outcome <- paste("gps.Z", i, sep = "")
+#     assign(outcome, dnorm(log2.AHI.threshold[i], mean = mean.pf, sd = s.pf))
+# }
+# 
+# for (i in 1:length(log2.AHI.threshold)){
+#     dta <- paste("T", i, ".dat", sep = "")
+#     assign(dta, data.frame(cbind(log2.AHI.threshold[i], get(paste("gps.Z", i, sep = "")))))
+# }
+# 
+# colnames(T1.dat) <- c("log.AHI.scaled", "gps.ols")
+# colnames(T2.dat) <- c("log.AHI.scaled", "gps.ols")
+# colnames(T3.dat) <- c("log.AHI.scaled", "gps.ols")
+# colnames(T4.dat) <- c("log.AHI.scaled", "gps.ols")
+# colnames(T5.dat) <- c("log.AHI.scaled", "gps.ols")
+# colnames(T6.dat) <- c("log.AHI.scaled", "gps.ols")
+# colnames(T7.dat) <- c("log.AHI.scaled", "gps.ols")
+# colnames(T8.dat) <- c("log.AHI.scaled", "gps.ols")
+# colnames(T9.dat) <- c("log.AHI.scaled", "gps.ols")
+```
+
+**Estimate the mean outcome at each of the Z values determined above - Dose/Response**
+
+```{r}
+# for (i in 1:9){
+#     dta <- paste("T", i, ".dat", sep = "")
+#     response <- paste("LP", i, sep = "")
+#     assign(response, predict(glm1, newdata = get(dta), type = "lp"))
+# }
+# 
+# for (i in 1:9){
+#     y <- paste("Y", i, sep = "")
+#     x <- paste("LP", i, sep = "")
+#     assign(y, mean(exp(get(x)) / (1 + exp(get(x)))))
+# }
+# 
+# dose.response.gps.cov.ols <- c(Y1, Y2, Y3, Y4, Y5, Y6, Y7, Y8, Y9)
+```
+
+
+###**Not doing this anymore**
+**Model the response with the continuous treatment and the covariate balanced propensity score**
+
+
+```{r}
+# glm1 <- lrm(LaidOff ~ log2.AHI.scaled + gps.cbps, 
+#             data = adapt)
+# 
+# #Linear predictor from propensity function estimated using CBPS
+# mean.cbps <- gps.mod.cbps$fitted.values
+# sd.cbps <- sqrt(gps.mod.cbps$sigmasq)
+# 
+# #Create gps.Z1-9
+# for (i in 1:length(log2.AHI.threshold)){
+#     outcome <- paste("gps.Z", i, sep = "")
+#     assign(outcome, dnorm(log2.AHI.threshold[i], mean = mean.cbps, sd = sd.cbps))
+# }
+# 
+# #Create dataframes from above valyes:
+# for (i in 1:length(log2.AHI.threshold)){
+#     dta <- paste("T", i, ".dat", sep = "")
+#     assign(dta, data.frame(cbind(log2.AHI.threshold[i], get(paste("gps.Z", i, sep = "")))))
+# }
+# 
+# colnames(T1.dat) <- c("log.AHI.scaled", "gps.cbps")
+# colnames(T2.dat) <- c("log.AHI.scaled", "gps.cbps")
+# colnames(T3.dat) <- c("log.AHI.scaled", "gps.cbps")
+# colnames(T4.dat) <- c("log.AHI.scaled", "gps.cbps")
+# colnames(T5.dat) <- c("log.AHI.scaled", "gps.cbps")
+# colnames(T6.dat) <- c("log.AHI.scaled", "gps.cbps")
+# colnames(T7.dat) <- c("log.AHI.scaled", "gps.cbps")
+# colnames(T8.dat) <- c("log.AHI.scaled", "gps.cbps")
+# colnames(T9.dat) <- c("log.AHI.scaled", "gps.cbps")
+# 
+# 
+# for (i in 1:9){
+#     dta <- paste("T", i, ".dat", sep = "")
+#     response <- paste("LP", i, sep = "")
+#     assign(response, predict(glm1, newdata = get(dta), type = "lp"))
+# }
+# 
+# for (i in 1:9){
+#     y <- paste("Y", i, sep = "")
+#     x <- paste("LP", i, sep = "")
+#     assign(y, mean(exp(get(x)) / (1 + exp(get(x)))))
+# }
+# 
+# dose.response.gps.cov.cbps <- c(Y1, Y2, Y3, Y4, Y5, Y6, Y7, Y8, Y9)
+```
+
+**Weighting using the generalized propensity score**
+```{r}
+# dose.df <- data.frame(log2.AHI.threshold)
+# names(dose.df) <- "log2.AHI.scaled"
+# 
+# #GPS-OLS weights:
+# #gps.wt.ols.trunc <- gps.wt.ols.trunc[-130] #Need to make the dimensions match
+# glm.wt <- lrm(LaidOff ~ log2.AHI.scaled,
+#               weights = gps.wt.ols.trunc,
+#               data = adapt)
+# LP <- predict(glm.wt, dose.df, type = "lp")
+# dose.response.gps.wt.ols <- exp(LP) / (1 + exp(LP))
+# 
+
+#GPS-CBPS:
+# gps.wt.cbps <- adapt$gps.wt.cbps
+# glm.wt.cbps <- lrm(LaidOff ~ log2.AHI.scaled,
+#                    weights = gps.wt.cbps,
+#                    data = adapt)
+# LP <- predict(glm.wt, dose.df, type = "lp")
+# dose.response.gps.wt.cbps <- exp(LP) / (1 + exp(LP))
+```
+
+
+Plot the dose-response functions:
+
+
+```{r}
+# miny <- min(c(dose.response.gps.cov.ols, dose.response.gps.cov.cbps,
+#               dose.response.gps.wt.ols, dose.response.gps.wt.cbps))
+# maxy <- max(c(dose.response.gps.cov.ols, dose.response.gps.cov.cbps,
+#               dose.response.gps.wt.ols, dose.response.gps.wt.cbps))
+
+
+# plot(log2.AHI.threshold, dose.response.gps.wt.ols,
+#      type = "b", pch=19, lty=1, col = "black",
+#      ylab = "Probability of History of Multiple Job Loss",
+#      xlab = "log2(AHI)")
+# lines(log2.AHI.threshold, dose.response.gps.cov.cbps,
+#       type = "b", pch = 12, lty = 3, col = "brown")
+# lines(log2.AHI.threshold, dose.response.gps.wt.ols,
+#       type = "b", pch = 15, lty = 4, col = "red")
+# lines(log2.AHI.threshold, dose.response.gps.wt.cbps,
+#       type = "b", pch = 17, lty = 5, col = "blue")
+# legend("topleft",
+#        legend = c("Covariate adjustment (GPS-OLS)",
+#                   "Covariate adjustment (GPS-CBPS)",
+#                   "Weighting (GPS-OLS)",
+#                   "Weighting (GPS-CBPS"),
+#        lty = 1:4,
+#        pch = c(19, 12, 15, 17, 18),
+#        col = c("black", "brown", "red", "blue"),
+#        bty = "n")
+```
+
+
+###The same plot, but now AHI is on its linear scale instead of the log.
+
+```{r echo = F}
+# plot(2^(log2.AHI.threshold), dose.response.gps.wt.ols,
+#      type = "b", pch=19, lty=1, col = "black",
+#      ylab = "Probability of History of Multiple Job Loss",
+#      xlab = "AHI")#, ylim = c(0.4, 0.75))
+# lines(log.AHI.threshold, dose.response.gps.cov.cbps,
+#       type = "b", pch = 12, lty = 3, col = "brown")
+# lines(log.AHI.threshold, dose.response.gps.wt.ols,
+#       type = "b", pch = 15, lty = 4, col = "red")
+# lines(log.AHI.threshold, dose.response.gps.wt.cbps,
+#       type = "b", pch = 17, lty = 5, col = "blue")
+# legend("bottomright",
+#        legend = c("Covariate adjustment (GPS-OLS)",
+#                   "Covariate adjustment (GPS-CBPS)",
+#                   "Weighting (GPS-OLS)",
+#                   "Weighting (GPS-CBPS"),
+#        lty = 1:4,
+#        pch = c(19, 12, 15, 17, 18),
+#        col = c("black", "brown", "red", "blue"),
+#        bty = "n")
+```
+
+
+###Gather the adjusted odds ratio AFTER the GPS:
+
+```{r}
+# 2^(coef(glm.wt))[2]
+# tc <- qt(0.975, df = nrow(adapt) - 2)
+# se <- 0.0788
+# E <- tc*se
+# pe <- glm.wt$coefficients[2]
+# ci <- c(pe - E, pe + E)
+# 2^ci
+```
+
+After the generalized propensity score weighting the odds ratio for a doubling in AHI is 1.49 with a 95% confidence interval of (1.34, 1.66)
+
+
+
+
+###Sensitivity Analysis for inclusion of BMI -- not used, but could be interesting. Mainly dropped because individuals w/o BMI were not missing at random.
+
+The number of participants that have BMI data is (n = 176). In addition the range of AHI values in this data is 0 - 14.3 (); this information should be considered because it does not have the same distribution of AHI as the original data. The 85 participants that did not have BMI data had a range from 0.30-64.90 with a mean of 15.42. The average of those without BMI data is not contained within the range of those with BMI data, this is a difference between groups that cannot be ignored.
+
+
+Perform a t-test for the difference in means between those with and without BMI data to confirm this notion. Alternative is that those without BMI data have greater mean AHI.
+```{r}
+# adapt$BMI_I <- ifelse(is.na(adapt$bmiv1) == T, 0, 1)
+# t.test(AHI ~ BMI_I, data = adapt,
+#        alternative = "greater")
+```
+Here, we reject the null hypothesis that the mean AHI in people with and without BMI is the same in favor of the alternative that the mean AHI in the group without BMI data is higher than the group without BMI data. Which confirms our notions and should be considered when interpreting the results of the following sensitivity analysis.
+
+```{r}
+#sens.dta <- adapt.w.bmi
+# unadj.mod <- glm(LaidOff ~ AHI + ns(Age, df = 3) + Gender + RaceCat +
+#                      Night.Shift + ShiftType + SocialJob + PayType,
+#                  data = sens.dta,
+#                  family = binomial(link = "logit"))
+# 
+# adj.mod <- glm(LaidOff ~ AHI + ns(Age, df = 3) + Gender + RaceCat +
+#                    Night.Shift + ShiftType + SocialJob + PayType +
+#                    bmiv1,
+#                data = sens.dta,
+#                family = binomial(link = "logit"))
+# 
+# round(exp(cbind(coef(unadj.mod) * 10, confint(unadj.mod) * 10)), 2)[2,]
+# round(exp(cbind(coef(adj.mod) * 10, confint(adj.mod) * 10)), 2)[2,]
+
+# unadj.mod.cat <- glm(LaidOff ~ AHI.cat + ns(Age, df = 3) + Gender + RaceCat +
+#                      FirstShift + SocialJob + PayType,
+#                  data = sens.dta,
+#                  family = binomial(link = "logit"))
+# 
+# adj.mod.cat <- glm(LaidOff ~ AHI.cat + ns(Age, df = 3) + Gender + RaceCat +
+#                    FirstShift + SocialJob + PayType +
+#                    ns(bmiv1, df = 3),
+#                data = sens.dta,
+#                family = binomial(link = "logit"))
+# 
+# round(exp(cbind(coef(unadj.mod.cat), confint(unadj.mod.cat))), 2)[2,]
+# round(exp(cbind(coef(adj.mod.cat), confint(adj.mod.cat))), 2)[2,]
+```
+
+```{r}
+# unadj.OR <- exp(coef(unadj.mod.cat))[2]
+# adj.OR <- exp(coef(adj.mod.cat))[2]
+# perc.change <- abs( (unadj.OR - adj.OR) / adj.OR )
+# perc.change
+```
+
+
+The percent change is 28.8%, which is greater than 10%, therefore we conclude that we must control for BMI when assessing the effect of AHI on having a history of multiple job loss. However, as previously stated, the results of this analysis should note the limitations of the available BMI and AHI data. A comment in the discussion should be made that this is a major limitation and 
+
+
+
+
+#Secondary Analysis
+
+If a person has a history of multiple job layoffs, is that person more likely to have come from a job that requires more social focus?
+
+```{r}
+# adapt2 <- adapt
+# social.bin <- ifelse(adapt2$SocialJob == "Social", 1, 0)
+# adapt2$Social <- social.bin
+# 
+# secondary <- glm(Social ~ AHI + ns(Age, df = 3) + Gender + RaceCat + 
+#                      BMI_I:BMI_Value + PayType + Night.Shift,
+#                  data = adapt2,
+#                  family = binomial(link = "logit"))
+# prob <- predict(secondary, type = c("response"))
+# adapt2$prob <- prob
+# g <- roc(Social ~ prob, data = adapt2)
+# g$auc
+# plot(g)
+# ci(g)
+```
+
+**I did not include the variable `LaidOff` as a covariate because we are looking at everyone that has suffered involuntary job loss which is everyone in the data. **
+
+```{r}
+# round(exp(cbind(coef(secondary) * 5, confint(secondary) * 5)), 2)[2,]
+# round(exp(cbind(coef(secondary) * 10, confint(secondary) * 10)), 2)[2,]
+# round(exp(cbind(coef(secondary) * 15, confint(secondary) * 15)), 2)[2,]
+```
+
+The adjusted odds ratio for a 5-unit increase in AHI is 0.94. This indicates that the odds of working in a job that requires social focus is less for those that have greater AHI. For a 10-unit increase in AHI, the adjusted odds ratio is 0.88. For a 15-unit increase the OR is 0.83. All three confidence intervals for the odds ratios include 1, incidating the relationship is not significantly different from 1.
+
+For the future, maybe we can think about how to more definitively understand which jobs require social focus. This information might be telling us also that people with greater levels of sleep disordered breathing avoid the types of work that would require them to have more social focus on a daily basis. In addition, it may be interesting to look at the odds ratio stratified on whether the participant had a history of multiple job loss or whether this was the first time that they have been laid off or fired.
+
+###Secondary analysis with log2.AHI
+```{r}
+# log.secondary <- glm(Social ~ log2.AHI + ns(Age, df = 3) + Gender + RaceCat + 
+#                      BMI_I:BMI_Value + PayType + ShiftType + Night.Shift,
+#                  data = adapt2,
+#                  family = binomial(link = "logit"))
+# prob <- predict(log.secondary, type = c("response"))
+# adapt2$prob <- prob
+# g <- roc(Social ~ prob, data = adapt2)
+# g$auc
+# #plot(g) - uncomment if wish to see ROC curve
+# ci(g)
+```
+
+####Gather adjusted OR from log.secondary model
+```{r}
+# round(2 ^ (cbind(coef(log.secondary), confint(log.secondary))), 3)[2,]
+```
